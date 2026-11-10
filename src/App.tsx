@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useState } from 'react'
 import {
   ShoppingCart,
@@ -125,6 +124,7 @@ function App() {
   const [product, setProduct] = useState<ProductInfo | null>(null)
   const [lookupLoading, setLookupLoading] = useState(false)
   const [productNotFound, setProductNotFound] = useState(false)
+  const [lookupSource, setLookupSource] = useState<'barcode' | 'name'>('barcode')
 
   const [cartItems, setCartItems] = useState<CartItem[]>([])
   const [cartLoading, setCartLoading] = useState(false)
@@ -514,6 +514,7 @@ function App() {
       }
 
       setScannedBarcode(barcode)
+      setLookupSource('barcode')
       setProduct(null)
       setProductNotFound(false)
       setLookupLoading(true)
@@ -591,6 +592,16 @@ function App() {
     [selectedStore],
   )
 
+  // A name-search result is already resolved to a store-specific product.
+  // It still uses the same add_cart_item RPC as barcode-scanned products.
+  const handleSelectSearchedProduct = (selectedProduct: ProductInfo) => {
+    setProduct(selectedProduct)
+    setLookupSource('name')
+    setScannedBarcode('PRODUCT_SEARCH')
+    setProductNotFound(false)
+    setError('')
+  }
+
   // Add product through the database RPC.
   const handleAddToCart = async () => {
     if (!product || !shoppingSessionId) return
@@ -611,6 +622,7 @@ function App() {
 
       setProduct(null)
       setScannedBarcode('')
+      setLookupSource('barcode')
     } catch (actionError) {
       setError(
         actionError instanceof Error
@@ -925,7 +937,7 @@ function App() {
                 <div>
                   <span className="location-badge">
                     <ScanLine size={14} />
-                    BARCODE DETECTED
+                    {lookupSource === 'barcode' ? 'BARCODE LOOKUP' : 'PRODUCT NAME SEARCH'}
                   </span>
                   <h2>Product lookup</h2>
                 </div>
@@ -937,6 +949,7 @@ function App() {
                     setScannedBarcode('')
                     setProduct(null)
                     setProductNotFound(false)
+                    setLookupSource('barcode')
                     setError('')
                   }}
                 >
@@ -945,7 +958,9 @@ function App() {
                 </button>
               </div>
 
-              <p className="barcode-value">{scannedBarcode}</p>
+              <p className="barcode-value">
+                {lookupSource === 'barcode' ? scannedBarcode : 'Selected from product search'}
+              </p>
 
               {lookupLoading && (
                 <div className="lookup-loading">
@@ -1025,7 +1040,9 @@ function App() {
               </div>
 
               <BarcodeScannerWasm
+                storeId={selectedStore?.id ?? ''}
                 onScan={handleScan}
+                onProductSelect={handleSelectSearchedProduct}
                 onClose={() => setShoppingSessionId('')}
               />
             </section>

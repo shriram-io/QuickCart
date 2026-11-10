@@ -1,6 +1,6 @@
-
 import { useEffect, useRef, useState } from 'react'
 import { readBarcodes } from 'zxing-wasm/reader'
+import { supabase } from './lib/supabase'
 import {
   Camera,
   X,
@@ -8,8 +8,33 @@ import {
   ScanLine,
 } from 'lucide-react'
 
+type StoreProductSuggestion = {
+  id: string
+  sku: string
+  price: number
+  currency_code: string
+  is_available: boolean
+  store_id: string
+}
+
+type SearchProduct = {
+  id: string
+  name: string
+  brand: string | null
+  unit_label: string | null
+  image_url: string | null
+  storeProduct: StoreProductSuggestion
+}
+
+type BarcodeSuggestion = {
+  barcode: string
+  product: SearchProduct
+}
+
 type Props = {
+  storeId: string
   onScan: (barcode: string) => void
+  onProductSelect: (product: SearchProduct) => void
   onClose: () => void
 }
 
@@ -26,7 +51,7 @@ function isValidEAN13(value: string) {
   return (10 - (sum % 10)) % 10 === digits[12]
 }
 
-function BarcodeScannerWasm({ onScan, onClose }: Props) {
+function BarcodeScannerWasm({ storeId, onScan, onProductSelect, onClose }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const scannedRef = useRef(false)
@@ -37,6 +62,13 @@ function BarcodeScannerWasm({ onScan, onClose }: Props) {
   const [status, setStatus] = useState('Starting camera...')
   const [error, setError] = useState('')
   const [manualCode, setManualCode] = useState('')
+  const [barcodeSuggestions, setBarcodeSuggestions] = useState<BarcodeSuggestion[]>([])
+  const [barcodeSearchLoading, setBarcodeSearchLoading] = useState(false)
+  const [barcodeSearchError, setBarcodeSearchError] = useState('')
+  const [productName, setProductName] = useState('')
+  const [nameSuggestions, setNameSuggestions] = useState<SearchProduct[]>([])
+  const [nameSearchLoading, setNameSearchLoading] = useState(false)
+  const [nameSearchError, setNameSearchError] = useState('')
   const [torchAvailable, setTorchAvailable] = useState(false)
   const [torchOn, setTorchOn] = useState(false)
 
@@ -52,6 +84,145 @@ function BarcodeScannerWasm({ onScan, onClose }: Props) {
   useEffect(() => {
     onScanRef.current = onScan
   }, [onScan])
+
+  // Prefix search for manually entered barcodes. Results are scoped to this store.
+  useEffect(() => {
+    const query = manualCode.trim()
+    setBarcodeSuggestions([])
+    setBarcodeSearchError('')
+
+    if (!storeId || query.length < 3 || !/^\d+$/.test(query)) {
+      setBarcodeSearchLoading(false)
+      return
+    }
+
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      setBarcodeSearchLoading(true)
+      try {
+        const { data, error } = await supabase
+          .from('product_barcodes')
+          .select(`
+            barcode,
+            products!inner (
+              id, name, brand, unit_label, image_url, is_active,
+              store_products!inner (
+                id, sku, price, currency_code, is_available, store_id
+              )
+            )
+          `)
+          .like('barcode', `${query}%`)
+          .eq('products.is_active', true)
+          .eq('products.store_products.store_id', storeId)
+          .eq('products.store_products.is_available', true)
+          .limit(12)
+
+        if (error) throw error
+        if (cancelled) return
+
+        const mapped: BarcodeSuggestion[] = []
+        for (const row of (data ?? []) as any[]) {
+          const product = row.products
+          const storeProduct = (product?.store_products ?? []).find(
+            (item: StoreProductSuggestion) => item.store_id === storeId && item.is_available,
+          )
+          if (!product || !storeProduct) continue
+          mapped.push({
+            barcode: row.barcode,
+            product: {
+              id: product.id,
+              name: product.name,
+              brand: product.brand,
+              unit_label: product.unit_label,
+              image_url: product.image_url,
+              storeProduct,
+            },
+          })
+        }
+        setBarcodeSuggestions(mapped)
+      } catch (searchError) {
+        if (!cancelled) {
+          setBarcodeSearchError(
+            searchError instanceof Error ? searchError.message : 'Barcode suggestions failed.',
+          )
+        }
+      } finally {
+        if (!cancelled) setBarcodeSearchLoading(false)
+      }
+    }, 250)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [manualCode, storeId])
+
+  // Product-name search uses the selected store's catalogue and store-specific prices.
+  useEffect(() => {
+    const query = productName.trim()
+    setNameSuggestions([])
+    setNameSearchError('')
+
+    if (!storeId || query.length < 2) {
+      setNameSearchLoading(false)
+      return
+    }
+
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      setNameSearchLoading(true)
+      try {
+        const { data, error } = await supabase
+          .from('store_products')
+          .select(`
+            id, sku, price, currency_code, is_available, store_id,
+            products!inner (id, name, brand, unit_label, image_url, is_active)
+          `)
+          .eq('store_id', storeId)
+          .eq('is_available', true)
+          .eq('products.is_active', true)
+          .ilike('products.name', `%${query}%`)
+          .limit(10)
+
+        if (error) throw error
+        if (cancelled) return
+
+        const mapped: SearchProduct[] = (data ?? []).flatMap((row: any) => {
+          const product = row.products
+          if (!product) return []
+          return [{
+            id: product.id,
+            name: product.name,
+            brand: product.brand,
+            unit_label: product.unit_label,
+            image_url: product.image_url,
+            storeProduct: {
+              id: row.id,
+              sku: row.sku,
+              price: Number(row.price),
+              currency_code: row.currency_code,
+              is_available: row.is_available,
+              store_id: row.store_id,
+            },
+          }]
+        })
+        setNameSuggestions(mapped)
+      } catch (searchError) {
+        if (!cancelled) {
+          setNameSearchError(
+            searchError instanceof Error ? searchError.message : 'Product search failed.',
+          )
+        }
+      } finally {
+        if (!cancelled) setNameSearchLoading(false)
+      }
+    }, 300)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [productName, storeId])
 
   useEffect(() => {
     let animationId = 0
@@ -468,6 +639,22 @@ const enhancedContext = enhancedCanvas.getContext('2d', {
     onScanRef.current(code)
   }
 
+  function chooseBarcodeSuggestion(barcode: string) {
+    if (scannedRef.current) return
+    scannedRef.current = true
+    streamRef.current?.getTracks().forEach(track => track.stop())
+    streamRef.current = null
+    onScanRef.current(barcode)
+  }
+
+  function chooseNameSuggestion(product: SearchProduct) {
+    if (scannedRef.current) return
+    scannedRef.current = true
+    streamRef.current?.getTracks().forEach(track => track.stop())
+    streamRef.current = null
+    onProductSelect(product)
+  }
+
   return (
     <div className="scanner-overlay">
       <section
@@ -573,6 +760,128 @@ const enhancedContext = enhancedCanvas.getContext('2d', {
             </button>
           </div>
         </form>
+
+        {barcodeSearchLoading && (
+          <p className="scanner-instruction">Searching matching barcodes...</p>
+        )}
+        {barcodeSearchError && <p className="app-error">{barcodeSearchError}</p>}
+        {barcodeSuggestions.length > 0 && (
+          <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
+            <strong>Matching products</strong>
+            {barcodeSuggestions.map((suggestion, index) => (
+              <button
+                key={`${suggestion.barcode}-${suggestion.product.storeProduct.id}-${index}`}
+                type="button"
+                onClick={() => chooseBarcodeSuggestion(suggestion.barcode)}
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: 12,
+                  width: '100%',
+                  padding: 12,
+                  border: '1px solid #dce7df',
+                  borderRadius: 12,
+                  background: '#fff',
+                  color: '#183b2b',
+                  textAlign: 'left',
+                  cursor: 'pointer',
+                }}
+              >
+                <span style={{ display: 'grid', gap: 3 }}>
+                  <strong>{suggestion.product.name}</strong>
+                  <small>{suggestion.barcode} · {suggestion.product.storeProduct.sku}</small>
+                </span>
+                <strong>
+                  {new Intl.NumberFormat('en-IN', {
+                    style: 'currency',
+                    currency: suggestion.product.storeProduct.currency_code,
+                    maximumFractionDigits: 2,
+                  }).format(suggestion.product.storeProduct.price)}
+                </strong>
+              </button>
+            ))}
+          </div>
+        )}
+        {manualCode.trim().length >= 3 &&
+          !barcodeSearchLoading &&
+          !barcodeSearchError &&
+          barcodeSuggestions.length === 0 && (
+            <p className="scanner-instruction">No matching available products for this barcode prefix.</p>
+          )}
+
+        <div className="scanner-divider">
+          <span>OR SEARCH BY PRODUCT NAME</span>
+        </div>
+        <div className="manual-code-form">
+          <label className="manual-code-label" htmlFor="product-name-search">
+            Product name
+          </label>
+          <div className="manual-code-row">
+            <input
+              id="product-name-search"
+              type="search"
+              value={productName}
+              onChange={event => setProductName(event.target.value)}
+              placeholder="Search milk, bread, rice..."
+              autoComplete="off"
+            />
+          </div>
+        </div>
+        {nameSearchLoading && (
+          <p className="scanner-instruction">Searching products...</p>
+        )}
+        {nameSearchError && <p className="app-error">{nameSearchError}</p>}
+        {nameSuggestions.map(product => (
+          <button
+            key={product.storeProduct.id}
+            type="button"
+            onClick={() => chooseNameSuggestion(product)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 12,
+              width: '100%',
+              marginTop: 8,
+              padding: 10,
+              border: '1px solid #dce7df',
+              borderRadius: 12,
+              background: '#fff',
+              color: '#183b2b',
+              textAlign: 'left',
+              cursor: 'pointer',
+            }}
+          >
+            {product.image_url ? (
+              <img
+                src={product.image_url}
+                alt=""
+                style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 8 }}
+              />
+            ) : (
+              <span style={{ width: 48, height: 48, display: 'grid', placeItems: 'center', background: '#eef4ef', borderRadius: 8 }}>
+                <ScanLine size={20} />
+              </span>
+            )}
+            <span style={{ flex: 1, display: 'grid', gap: 3 }}>
+              <strong>{product.name}</strong>
+              <small>{[product.brand, product.unit_label, product.storeProduct.sku].filter(Boolean).join(' · ')}</small>
+            </span>
+            <strong>
+              {new Intl.NumberFormat('en-IN', {
+                style: 'currency',
+                currency: product.storeProduct.currency_code,
+                maximumFractionDigits: 2,
+              }).format(product.storeProduct.price)}
+            </strong>
+          </button>
+        ))}
+        {productName.trim().length >= 2 &&
+          !nameSearchLoading &&
+          !nameSearchError &&
+          nameSuggestions.length === 0 && (
+            <p className="scanner-instruction">No matching available products found.</p>
+          )}
       </section>
     </div>
   )
